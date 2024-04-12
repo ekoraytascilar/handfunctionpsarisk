@@ -1,0 +1,196 @@
+---
+title: "Hand Function and Risk of PsA development"
+subtitle: "A prospective observational study."
+author: "Koray Tascilar"
+date: today
+date-format: DD MMMM YYYY
+format: pdf
+documentclass: report
+geometry: 
+  - top=30mm
+  - left=20mm
+  - bottom=30mm
+toc: true
+number-sections: true
+editor: source
+---
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(survival)
+library(survminer)
+library(kableExtra)
+library(readxl)
+library(writexl)
+library(janitor)
+library(magrittr)
+library(broom)
+source("myfunctionz.R")
+
+```
+
+```{r}
+# Read dataset
+
+filenames <- list.files(path = "Datasets", pattern = "xlsx", full.names = TRUE)
+
+original_data <- read_xlsx(filenames[str_detect(filenames,"joined_data")])
+original_correcteddates <- read_xlsx(filenames[str_detect(filenames,"PsA ED")])
+
+df_datecorrection <- original_correcteddates |> 
+  clean_names() |>
+  remove_empty() |> 
+  select(handkraft_id,date_corrected=psa_ed)
+
+df_analyze <- original_data |> 
+  clean_names() |> 
+  remove_empty() |>
+  filter(group=="PsO") |> 
+  left_join(df_datecorrection,by="handkraft_id") |> 
+  rowwise() |>
+  mutate( date_psadiagnosis_old=date_psadiagnosis,
+          event=!is.na(date_psadiagnosis),
+          date_psadiagnosis=if_else(is.na(date_corrected),
+                                    date_psadiagnosis_old,
+                                    date_corrected),
+          t=inftona(time_length(interval(date_handassessment,
+                                         min(date_last_fu,date_psadiagnosis,
+                                             na.rm = TRUE)), 
+                                unit="week")),
+          event=!is.na(date_psadiagnosis),
+          across(contains("_score_"),~ifelse(.x==0,"no","yes")),
+          across(contains("mput"),~log(.x),.names="log_{.col}"))
+
+vars_numeric <- df_analyze |> select(where(is.numeric)) |> names()
+vars_character <- df_analyze |> select(where(is.character)) |> names()
+
+df_analyze_long <- df_analyze |> 
+  select(handkraft_id,t,event,age:psk36,-crp,-dominance,
+         contains("_score_"),starts_with("log_")) |> 
+  pivot_longer(cols = age:last_col(), 
+               names_to = "variable", 
+               values_to = "value",
+               values_transform = list(value = as.character)) |> 
+  mutate(varcat=case_when(
+    variable %in% vars_character ~ "categorical",
+    variable %in% vars_numeric ~ "numeric"
+  )) 
+
+ttest_nice <- possibly(t.test,otherwise = NA)
+coxph_nice <- possibly(coxph,otherwise = NA)
+update_nice <- possibly(update,otherwise = NA)
+concordance_nice <- possibly(concordance,otherwise = NA)
+```
+
+
+# Study population
+The study consists of two pooled cohorts who were followed prospectively for the development of PsA. These were evaluated for hand-function at baseline.
+
+
+
+```{r}
+
+df_data_long_tomodel <- df_analyze_long |>
+  left_join(df_analyze |> 
+              select(handkraft_id,
+                     haq_score,
+                     vas_global,
+                     ksk36, 
+                     dlqi_score,
+                     ps_aid_total))
+
+models_overall <- df_data_long_tomodel |> 
+  nest_by(variable) |> 
+  mutate(data=list(data |> mutate(value=ifelse(varcat=="numeric",as.numeric(value),value))),
+         model_cox=list(coxph_nice(Surv(t,event)~value,data=data)),
+         model_cox_tidy=list(tidy(model_cox,exponentiate = TRUE,conf.int = TRUE)),
+         n_complete=sum(with(data,complete.cases(t,event,value))),
+         c_stat_raw=list(concordance_nice(model_cox)),
+         c_stat=c_stat_raw$concordance,
+         ttest=list(ttest_nice(value~event,data=data)),
+         ttest_tidy=list(tidy(ttest))
+  )
+
+
+models_overall |>
+  select(variable,model_cox_tidy,c_stat,n_complete) |>
+  unnest(model_cox_tidy) |> 
+  View()
+
+models_handfunction_adjusted <- df_data_long_tomodel |> 
+  filter(str_detect(variable,"mhq")|str_detect(variable, "mput")) |> 
+  nest_by(variable) |> 
+  mutate(data=list(data |> mutate(value=ifelse(varcat=="numeric",as.numeric(value),value))),
+         modelcox_unadjusted=list(coxph_nice(Surv(t,event)~value,data=data)),
+         modelcox_haq=list(coxph_nice(Surv(t,event)~value+haq_score,data=data)),
+         modelcox_vas=list(coxph_nice(Surv(t,event)~value+vas_global, data=data)),
+         modelcox_ksk36=list(coxph_nice(Surv(t,event)~value+ksk36, data=data)),
+         modelcox_dlqi=list(coxph_nice(Surv(t, event) ~ value + dlqi_score, data = data)),
+         modelcox_psaid=list(coxph_nice(Surv(t, event) ~ value + ps_aid_total, data = data)),
+         ncomplete_unadjusted=sum(with(data,complete.cases(t,event,value))),
+         ncomplete_haq=sum(with(data,complete.cases(t,event,value,haq_score))),
+         ncomplete_vas=sum(with(data,complete.cases(t,event,value,vas_global))),
+         ncomplete_ksk36=sum(with(data,complete.cases(t,event,value,ksk36))),
+         ncomplete_dlqi=sum(with(data,complete.cases(t,event,value,dlqi_score))),
+         ncomplete_psaid=sum(with(data,complete.cases(t,event,value,ps_aid_total))),
+         modelcoxtidy_unadjusted=list(tidy(modelcox_unadjusted,exponentiate = TRUE,conf.int = TRUE)),
+         modelcoxtidy_haq=list(tidy(modelcox_haq,exponentiate = TRUE,conf.int = TRUE)),
+         modelcoxtidy_vas=list(tidy(modelcox_vas,exponentiate = TRUE,conf.int = TRUE)),
+         modelcoxtidy_ksk36=list(tidy(modelcox_ksk36,exponentiate = TRUE,conf.int = TRUE)),
+         modelcoxtidy_dlqi=list(tidy(modelcox_dlqi,exponentiate = TRUE,conf.int = TRUE)),
+         modelcoxtidy_psaid=list(tidy(modelcox_psaid,exponentiate = TRUE,conf.int = TRUE)),
+         
+         cstatraw_unadjusted=list(concordance_nice(modelcox_unadjusted)),
+         cstatraw_haq=list(concordance_nice(modelcox_haq)),
+         cstatraw_vas=list(concordance_nice(modelcox_vas)),
+         cstatraw_ksk36=list(concordance_nice(modelcox_ksk36)),
+         cstatraw_dlqi=list(concordance_nice(modelcox_dlqi)),
+         cstatraw_psaid=list(concordance_nice(modelcox_psaid)),
+         
+         cstat_unadjusted=cstatraw_unadjusted$concordance,
+         cstat_haq=cstatraw_haq$concordance,
+         cstat_vas=cstatraw_vas$concordance,
+         cstat_ksk36=cstatraw_ksk36$concordance,
+         cstat_dlqi=cstatraw_dlqi$concordance,
+         cstat_psaid=cstatraw_psaid$concordance,
+
+  )
+
+models_adjusted_long <- models_handfunction_adjusted |> 
+  pivot_longer(cols = -c(variable,data),
+               names_to =c(".value","adjustment"),
+               names_pattern=c("(.+)_(.+)"))
+
+# Unnest tidy models and plot coefficients.
+
+df_coefficientswithadjustment <- models_adjusted_long |> 
+  select(variable,adjustment,ncomplete,modelcoxtidy,cstat) |> 
+  unnest(modelcoxtidy) |> 
+  arrange(variable,adjustment) |> 
+  filter(term=="value")
+
+df_coefficientswithadjustment |>
+  mutate(adjustment=fct_relevel(adjustment,"unadjusted","haq","vas","ksk36","dlqi","psaid")) |>
+  ggplot(aes(x=estimate, y=fct_rev(adjustment)))+
+  geom_point(aes(size=cstat))+
+  geom_linerange(aes(xmin=conf.low,xmax=conf.high))+
+  facet_wrap(~variable,scales="free")+
+  geom_vline(xintercept=1,linetype="dashed",alpha=0.3)+
+  theme_classic()+
+  scale_x_log10()+
+  labs(title="Cox proportional hazards models",
+       subtitle="Unadjusted and adjusted models",
+       x="Hazard ratio (95% CI)",
+       y="Adjustment", size="Harrel's C")+
+  theme(strip.background=element_blank(), legend.position = c(0.8,0.15))
+# plot KM curve
+
+ggsurvplot(df_analyze %$% survfit(Surv(t,event)~1),
+           data=df_analyze,conf.int=TRUE,
+           risk.table="nrisk_cumevents") 
+
+
+```
+
